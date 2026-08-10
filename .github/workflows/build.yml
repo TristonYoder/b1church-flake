@@ -1,0 +1,186 @@
+name: Build B1 Church images
+
+# Tracks ChurchApps upstream `main` without forking: resolves the three repos'
+# current commits, builds them, publishes one tag covering the set, and commits
+# that tag to image.nix. This repo's git revision is therefore the deployed
+# version — consumers pin it through flake.lock and upgrade with
+# `nix flake update`.
+#
+# The tag is derived from the three upstream SHAs, so a night where nothing
+# changed upstream produces the same tag and the run exits early. That keeps
+# flake.lock churn proportional to real upstream change rather than to the
+# calendar.
+#
+# Build-time URLs come from `nix eval .#buildArgs`, i.e. from deployment.nix —
+# the same file the NixOS module reads. They are inlined by Vite / Next during
+# the build and are not read at runtime.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if upstream is unchanged"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # commits the resolved tag back to image.nix
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Resolve upstream commits and derive the image tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          api=$(git ls-remote https://github.com/ChurchApps/Api.git    refs/heads/main | cut -f1)
+          admin=$(git ls-remote https://github.com/ChurchApps/B1Admin.git refs/heads/main | cut -f1)
+          portal=$(git ls-remote https://github.com/ChurchApps/B1App.git  refs/heads/main | cut -f1)
+
+          # One tag for the set — the module deploys all three at the same tag,
+          # and a per-repo tag would make "which combination is running?"
+          # unanswerable.
+          tag="u$(printf '%s-%s-%s' "$api" "$admin" "$portal" | sha256sum | cut -c1-12)"
+
+          current=$(nix eval --raw .#image.tag 2>/dev/null || echo "")
+
+          {
+            echo "api=$api"
+            echo "admin=$admin"
+            echo "portal=$portal"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$tag" = "$current" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged; already published \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Export build args from deployment.nix
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # deployment.nix is the single source of truth; the module reads the
+          # same file, so the images and the deployment cannot disagree.
+          nix eval --json .#buildArgs > /tmp/buildargs.json
+          nix eval --json .#dotenv    > /tmp/dotenv.json
+
+          # build-push-action takes build-args as a multiline string, so hand
+          # each set through the environment. The Api needs none — it reads
+          # everything at runtime.
+          for c in admin portal; do
+            var="$(echo "$c" | tr '[:lower:]' '[:upper:]')_ARGS"
+            {
+              echo "$var<<__ARGS_EOF__"
+              jq -r --arg c "$c" '.[$c] | to_entries[] | "\(.key)=\(.value)"' /tmp/buildargs.json
+              echo "__ARGS_EOF__"
+            } >> "$GITHUB_ENV"
+          done
+
+      - uses: docker/login-action@v3
+        if: steps.resolve.outputs.changed == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.resolve.outputs.changed == 'true'
+
+      - name: Check out upstream sources
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ChurchApps/Api.git     src-api
+          git clone --depth 1 https://github.com/ChurchApps/B1Admin.git src-admin
+          git clone --depth 1 https://github.com/ChurchApps/B1App.git   src-portal
+
+          # B1Admin reads REACT_APP_B1_WEBSITE_URL (src/helpers/
+          # EnvironmentHelper.ts) but its Dockerfile declares no matching ARG,
+          # so a --build-arg would be silently dropped. Vite's loadEnv picks it
+          # up from a .env in the build context instead. Without this the admin
+          # UI links members at staging.b1.church rather than our own portal.
+          jq -r '.admin | to_entries[] | "\(.key)=\(.value)"' /tmp/dotenv.json >> src-admin/.env
+
+      - name: Build and push api
+        if: steps.resolve.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src-api
+          push: true
+          tags: ghcr.io/tristonyoder/b1church-api:${{ steps.resolve.outputs.tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build and push admin
+        if: steps.resolve.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src-admin
+          push: true
+          build-args: ${{ env.ADMIN_ARGS }}
+          tags: ghcr.io/tristonyoder/b1church-admin:${{ steps.resolve.outputs.tag }}
+          cache-from: type=gha,scope=admin
+          cache-to: type=gha,scope=admin,mode=max
+
+      - name: Build and push portal
+        if: steps.resolve.outputs.changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src-portal
+          push: true
+          build-args: ${{ env.PORTAL_ARGS }}
+          tags: ghcr.io/tristonyoder/b1church-portal:${{ steps.resolve.outputs.tag }}
+          cache-from: type=gha,scope=portal
+          cache-to: type=gha,scope=portal,mode=max
+
+      - name: Record the published tag
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cat > image.nix <<EOF
+          # Written by .github/workflows/build.yml — do not edit by hand.
+          #
+          # The nightly build publishes tagged images and commits the tag here,
+          # so this repo's git revision *is* the deployed version: consumers pin
+          # it through flake.lock and upgrade with \`nix flake update b1church\`.
+          #
+          # The tag is derived from the three upstream commits below, so it only
+          # changes when upstream does.
+          {
+            registry = "ghcr.io/tristonyoder/b1church";
+            tag = "${{ steps.resolve.outputs.tag }}";
+
+            upstream = {
+              api = "${{ steps.resolve.outputs.api }}";
+              admin = "${{ steps.resolve.outputs.admin }}";
+              portal = "${{ steps.resolve.outputs.portal }}";
+            };
+          }
+          EOF
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add image.nix
+          git commit -m "build: publish ${{ steps.resolve.outputs.tag }}
+
+          Api     ${{ steps.resolve.outputs.api }}
+          B1Admin ${{ steps.resolve.outputs.admin }}
+          B1App   ${{ steps.resolve.outputs.portal }}"
+          git push
+
+          echo "Published \`${{ steps.resolve.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
