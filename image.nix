@@ -1,19 +1,18 @@
 # Written by .github/workflows/build.yml — do not edit by hand.
 #
-# The nightly build publishes SHA-tagged images and commits the tag here, so
-# this repo's git revision *is* the deployed version: consumers pin it through
-# flake.lock and upgrade with `nix flake update b1church`.
+# The nightly build publishes tagged images and commits the tag here,
+# so this repo's git revision *is* the deployed version: consumers pin
+# it through flake.lock and upgrade with `nix flake update b1church`.
 #
-# `tag = null` means no build has published yet; the module refuses to
-# evaluate rather than deploying a tag no registry serves.
+# The tag is derived from the three upstream commits below, so it only
+# changes when upstream does.
 {
   registry = "ghcr.io/tristonyoder/b1church";
-  tag = null;
+  tag = "uaccc6095b990";
 
-  # Upstream commits the above tag was built from, for provenance.
   upstream = {
-    api = null;
-    admin = null;
-    portal = null;
+    api = "05775af738426c1b6e1d731a289c08e0729f1077";
+    admin = "f71b017df3580e6e7bdcbabd3bf69d3ba53a8052";
+    portal = "ed820c22b7b44aa22e05278460e965144f868b0a";
   };
 }
