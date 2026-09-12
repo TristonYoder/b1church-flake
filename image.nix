@@ -8,11 +8,11 @@
 # changes when upstream does.
 {
   registry = "ghcr.io/tristonyoder/b1church";
-  tag = "ub2af281d04f4";
+  tag = "u817a511b5720";
 
   upstream = {
-    api = "e92b9aaa8b2a398afd87119edfb394157e888dda";
-    admin = "f00a7a2811da7ef931a2c5f98df9ed02c89e7e2a";
-    portal = "1c7af703b1d32eac8964b35b06bb27621906f26d";
+    api = "f293dd9ae114850baa0015f83e213e4dbd3fe127";
+    admin = "035cb654dba29dba3ae70a7c6443acea1f966052";
+    portal = "86cd6ff9a96e9f3222f43b2e93c4447ebc695b54";
   };
 }
